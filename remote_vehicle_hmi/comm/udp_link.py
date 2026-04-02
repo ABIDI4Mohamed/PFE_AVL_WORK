@@ -1,6 +1,7 @@
 import socket
 import struct
 import threading
+import time
 
 
 class UDPLink:
@@ -23,6 +24,9 @@ class UDPLink:
 
         self.running = False
 
+        # Reference start time for relative timestamps
+        self.t0 = time.perf_counter()
+
         self.latest_feedback = {
             "speed_mps": 0.0,
             "yaw_rad": 0.0,
@@ -31,7 +35,16 @@ class UDPLink:
         }
 
     def send_commands(self, steer_deg: float, accel_norm: float, brake_norm: float) -> None:
-        packet = struct.pack("fff", float(steer_deg), float(accel_norm), float(brake_norm))
+        tx_time = time.perf_counter() - self.t0
+
+        # Send 4 float32 values: steer, accel, brake, tx_time
+        packet = struct.pack(
+            "ffff",
+            float(steer_deg),
+            float(accel_norm),
+            float(brake_norm),
+            float(tx_time),
+        )
         self.tx_sock.sendto(packet, self.send_addr)
 
     def start_receiver(self) -> None:

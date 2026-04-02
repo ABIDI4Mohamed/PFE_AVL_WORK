@@ -1,4 +1,5 @@
 import math
+import time
 import win32gui
 import win32con
 
@@ -85,7 +86,6 @@ class SpeedometerWidget(QWidget):
 
         rect = self.rect().adjusted(14, 14, -14, -14)
 
-        # Descendre légèrement le compteur pour libérer l'espace du haut
         cx = rect.center().x()
         cy = rect.center().y() + 42
         radius = min(rect.width(), rect.height()) * 0.34
@@ -95,7 +95,6 @@ class SpeedometerWidget(QWidget):
 
         arc_rect = QRectF(cx - radius, cy - radius, 2 * radius, 2 * radius)
 
-        # Arc de fond
         bg_pen = QPen(QColor("#263754"), 10)
         bg_pen.setCapStyle(Qt.RoundCap)
         painter.setPen(bg_pen)
@@ -103,13 +102,11 @@ class SpeedometerWidget(QWidget):
 
         ratio = min(max(self.speed_kmh / self.max_speed_kmh, 0.0), 1.0)
 
-        # Arc de progression
         prog_pen = QPen(QColor("#67b3ff"), 8)
         prog_pen.setCapStyle(Qt.RoundCap)
         painter.setPen(prog_pen)
         painter.drawArc(arc_rect, start_deg * 16, int(-span_deg * ratio * 16))
 
-        # Graduations
         total_ticks = 28
         for i in range(total_ticks + 1):
             tick_ratio = i / total_ticks
@@ -128,7 +125,6 @@ class SpeedometerWidget(QWidget):
             painter.setPen(pen)
             painter.drawLine(p1, p2)
 
-        # Chiffres des graduations : un peu plus loin du centre
         painter.setPen(QColor("#e7f0ff"))
         painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
 
@@ -145,7 +141,6 @@ class SpeedometerWidget(QWidget):
             text_rect = QRectF(tx - 16, ty - 10, 32, 20)
             painter.drawText(text_rect, Qt.AlignCenter, str(value))
 
-        # Aiguille
         needle_deg = start_deg - span_deg * ratio
         na = math.radians(needle_deg)
 
@@ -157,12 +152,10 @@ class SpeedometerWidget(QWidget):
         painter.setPen(needle_pen)
         painter.drawLine(QPointF(cx, cy), needle_end)
 
-        # Moyeu central
         painter.setBrush(QColor("#0e1a2b"))
         painter.setPen(QPen(QColor("#22324d"), 2))
         painter.drawEllipse(QPointF(cx, cy), 14, 14)
 
-        # Bloc texte du haut : remonté pour éviter le chevauchement
         painter.setPen(QColor("#ffffff"))
         painter.setFont(QFont("Segoe UI", 20, QFont.Bold))
         painter.drawText(
@@ -187,6 +180,7 @@ class SpeedometerWidget(QWidget):
             f"{self.speed_mps:.1f} m/s"
         )
 
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -197,6 +191,10 @@ class MainWindow(QMainWindow):
         self.accel_cmd_percent = 0
         self.brake_cmd_percent = 0
 
+        self.last_manual_input_time = 0.0
+        self.manual_guard_time = 0.05   # 50 ms
+        self.heartbeat_period_ms = 20   # 50 Hz
+
         self.udp_link = UDPLink(send_port=25000, recv_port=25001)
         self.udp_link.start_receiver()
 
@@ -206,6 +204,10 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self._apply_styles()
         self._connect_signals()
+
+        self.command_timer = QTimer(self)
+        self.command_timer.timeout.connect(self._send_heartbeat_command)
+        self.command_timer.start(self.heartbeat_period_ms)
 
         self.feedback_timer = QTimer(self)
         self.feedback_timer.timeout.connect(self._update_feedback_display)
@@ -248,6 +250,7 @@ class MainWindow(QMainWindow):
         self.steer_dial.setValue(0)
         self.steer_dial.setNotchesVisible(True)
         self.steer_dial.setWrapping(False)
+        self.steer_dial.setTracking(True)
         self.steer_dial.setFixedSize(210, 210)
         layout.addWidget(self.steer_dial, alignment=Qt.AlignCenter)
 
@@ -268,6 +271,7 @@ class MainWindow(QMainWindow):
         self.accel_slider.setObjectName("accelSlider")
         self.accel_slider.setRange(0, 100)
         self.accel_slider.setValue(0)
+        self.accel_slider.setTracking(True)
         self.accel_slider.setFixedHeight(220)
         accel_layout.addWidget(self.accel_slider, alignment=Qt.AlignCenter)
 
@@ -290,6 +294,7 @@ class MainWindow(QMainWindow):
         self.brake_slider.setObjectName("brakeSlider")
         self.brake_slider.setRange(0, 100)
         self.brake_slider.setValue(0)
+        self.brake_slider.setTracking(True)
         self.brake_slider.setFixedHeight(220)
         brake_layout.addWidget(self.brake_slider, alignment=Qt.AlignCenter)
 
@@ -428,11 +433,27 @@ class MainWindow(QMainWindow):
         self.accel_value_label.setText(f"{self.accel_cmd_percent}%")
         self.brake_value_label.setText(f"{self.brake_cmd_percent}%")
 
+        self.last_manual_input_time = time.perf_counter()
+
+        # Immediate priority for manual command
+        self._send_last_command()
+
+    def _send_last_command(self) -> None:
+        # Compatible with your current udp_link.py that still adds tx_time internally
         self.udp_link.send_commands(
             float(self.steer_cmd_deg),
             self.accel_cmd_percent / 100.0,
             self.brake_cmd_percent / 100.0,
         )
+
+    def _send_heartbeat_command(self) -> None:
+        now = time.perf_counter()
+
+        # If a fresh manual action just happened, skip this heartbeat
+        if now - self.last_manual_input_time < self.manual_guard_time:
+            return
+
+        self._send_last_command()
 
     def _update_feedback_display(self) -> None:
         fb = self.udp_link.latest_feedback
