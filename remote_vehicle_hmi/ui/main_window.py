@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QPushButton,
     QSlider,
     QVBoxLayout,
     QWidget,
@@ -46,7 +47,6 @@ class AspectRatioFrame(QFrame):
 
         target_ratio = self.aspect_w / self.aspect_h
         current_ratio = host_w / host_h
-
         crop_factor = 1.06
 
         if current_ratio > target_ratio:
@@ -72,7 +72,7 @@ class SpeedometerWidget(QWidget):
         self.speed_kmh = 0.0
         self.speed_mps = 0.0
         self.max_speed_kmh = 220.0
-        self.setMinimumSize(260, 300)
+        self.setMinimumSize(250, 290)
         self.setObjectName("speedometer")
 
     def set_speed(self, speed_mps: float):
@@ -87,12 +87,11 @@ class SpeedometerWidget(QWidget):
         rect = self.rect().adjusted(14, 14, -14, -14)
 
         cx = rect.center().x()
-        cy = rect.center().y() + 42
+        cy = rect.center().y() + 38
         radius = min(rect.width(), rect.height()) * 0.34
 
         start_deg = 225
         span_deg = 270
-
         arc_rect = QRectF(cx - radius, cy - radius, 2 * radius, 2 * radius)
 
         bg_pen = QPen(QColor("#263754"), 10)
@@ -191,15 +190,22 @@ class MainWindow(QMainWindow):
         self.accel_cmd_percent = 0
         self.brake_cmd_percent = 0
 
+        self.emergency_active = 0.0
+        self.reset_cmd = 0.0
+
         self.last_manual_input_time = 0.0
-        self.manual_guard_time = 0.05   # 50 ms
-        self.heartbeat_period_ms = 20   # 50 Hz
+        self.manual_guard_time = 0.05
+        self.heartbeat_period_ms = 20
 
         self.udp_link = UDPLink(send_port=25000, recv_port=25001)
         self.udp_link.start_receiver()
 
         self.viewer_hwnd = None
         self.viewer_embedded = False
+
+        self.reset_pulse_timer = QTimer(self)
+        self.reset_pulse_timer.setSingleShot(True)
+        self.reset_pulse_timer.timeout.connect(self._clear_reset_cmd)
 
         self._setup_ui()
         self._apply_styles()
@@ -307,9 +313,42 @@ class MainWindow(QMainWindow):
         pedal_row.addWidget(brake_box)
         layout.addLayout(pedal_row)
 
-        hint = QLabel("Sending steer / accel / brake to Simulink via UDP")
+        safety_box = QFrame()
+        safety_box.setObjectName("subPanel")
+        safety_layout = QVBoxLayout(safety_box)
+        safety_layout.setSpacing(10)
+
+        safety_title = QLabel("SAFETY COMMANDS")
+        safety_title.setObjectName("sectionTitle")
+        safety_title.setAlignment(Qt.AlignCenter)
+        safety_layout.addWidget(safety_title)
+
+        self.emergency_btn = QPushButton("EMERGENCY STOP")
+        self.emergency_btn.setObjectName("emergencyButton")
+        self.emergency_btn.setCheckable(True)
+        self.emergency_btn.setMinimumHeight(54)
+
+        self.reset_btn = QPushButton("RESET")
+        self.reset_btn.setObjectName("resetButton")
+        self.reset_btn.setMinimumHeight(46)
+
+        self.safety_status_label = QLabel("Emergency: OFF | Reset: 0")
+        self.safety_status_label.setObjectName("hintLabel")
+        self.safety_status_label.setAlignment(Qt.AlignCenter)
+
+        safety_layout.addWidget(self.emergency_btn)
+        safety_layout.addWidget(self.reset_btn)
+        safety_layout.addWidget(self.safety_status_label)
+
+        layout.addWidget(safety_box)
+
+        hint = QLabel(
+            "Sending [steer, accel, brake, tx_time, RTT, jitter, checksum, "
+            "last_throttle, last_brake, emergency_button, reset_cmd] via UDP"
+        )
         hint.setObjectName("hintLabel")
         hint.setAlignment(Qt.AlignCenter)
+        hint.setWordWrap(True)
         layout.addWidget(hint)
 
         return panel
@@ -318,7 +357,7 @@ class MainWindow(QMainWindow):
         panel = QFrame()
         panel.setObjectName("panel")
         layout = QVBoxLayout(panel)
-        layout.setSpacing(8)
+        layout.setSpacing(10)
 
         title = QLabel("SIMULATION 3D VIEW")
         title.setObjectName("panelTitle")
@@ -343,10 +382,25 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self.viewer_host, 1)
 
-        self.viewer_info = QLabel("Simulation 3D Viewer embedded")
-        self.viewer_info.setObjectName("bottomInfo")
-        self.viewer_info.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.viewer_info)
+        self.viewer_status_frame = QFrame()
+        self.viewer_status_frame.setObjectName("viewerStatusFrame")
+        status_layout = QHBoxLayout(self.viewer_status_frame)
+        status_layout.setContentsMargins(12, 8, 12, 8)
+        status_layout.setSpacing(24)
+
+        self.mode_row = self._make_status_row("MODE", "--")
+        self.fault_row = self._make_status_row("FAULT", "--")
+        self.viewer_row = self._make_status_row("VIEWER", "WAITING")
+
+        self.mode_value = self.mode_row["value"]
+        self.fault_value = self.fault_row["value"]
+        self.viewer_state_value = self.viewer_row["value"]
+
+        status_layout.addLayout(self.mode_row["layout"], 1)
+        status_layout.addLayout(self.fault_row["layout"], 1)
+        status_layout.addLayout(self.viewer_row["layout"], 1)
+
+        layout.addWidget(self.viewer_status_frame)
 
         return panel
 
@@ -354,7 +408,7 @@ class MainWindow(QMainWindow):
         panel = QFrame()
         panel.setObjectName("panel")
         layout = QVBoxLayout(panel)
-        layout.setSpacing(14)
+        layout.setSpacing(12)
 
         title = QLabel("SIMULINK FEEDBACK")
         title.setObjectName("panelTitle")
@@ -363,7 +417,7 @@ class MainWindow(QMainWindow):
 
         speed_card = QFrame()
         speed_card.setObjectName("speedCard")
-        speed_card.setMinimumHeight(420)
+        speed_card.setMinimumHeight(390)
 
         speed_layout = QVBoxLayout(speed_card)
         speed_layout.setContentsMargins(10, 10, 10, 10)
@@ -379,23 +433,44 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(speed_card)
 
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(12)
-        grid.setVerticalSpacing(12)
+        vehicle_grid = QGridLayout()
+        vehicle_grid.setHorizontalSpacing(10)
+        vehicle_grid.setVerticalSpacing(10)
 
         self.yaw_card = self._make_metric_card("YAW", "0.0°")
         self.yaw_rate_card = self._make_metric_card("YAW RATE", "0.0°/s")
-        self.connection_card = self._make_metric_card("LINK", "OFFLINE")
 
         self.yaw_value = self.yaw_card["value"]
         self.yaw_rate_value = self.yaw_rate_card["value"]
-        self.connection_value = self.connection_card["value"]
 
-        grid.addWidget(self.yaw_card["frame"], 0, 0)
-        grid.addWidget(self.yaw_rate_card["frame"], 1, 0)
-        grid.addWidget(self.connection_card["frame"], 2, 0)
+        vehicle_grid.addWidget(self.yaw_card["frame"], 0, 0)
+        vehicle_grid.addWidget(self.yaw_rate_card["frame"], 1, 0)
 
-        layout.addLayout(grid)
+        layout.addLayout(vehicle_grid)
+
+        self.network_frame = QFrame()
+        self.network_frame.setObjectName("metricCard")
+        network_layout = QVBoxLayout(self.network_frame)
+        network_layout.setSpacing(8)
+
+        network_title = QLabel("NETWORK STATUS")
+        network_title.setObjectName("metricTitle")
+        network_title.setAlignment(Qt.AlignCenter)
+        network_layout.addWidget(network_title)
+
+        self.rtt_row = self._make_status_row("RTT", "0.0 ms")
+        self.jitter_row = self._make_status_row("JITTER", "0.0 ms")
+        self.link_row = self._make_status_row("LINK", "OFFLINE")
+
+        network_layout.addLayout(self.rtt_row["layout"])
+        network_layout.addLayout(self.jitter_row["layout"])
+        network_layout.addLayout(self.link_row["layout"])
+
+        self.rtt_value = self.rtt_row["value"]
+        self.jitter_value = self.jitter_row["value"]
+        self.connection_value = self.link_row["value"]
+
+        layout.addWidget(self.network_frame)
         layout.addStretch()
 
         return panel
@@ -419,10 +494,76 @@ class MainWindow(QMainWindow):
 
         return {"frame": frame, "value": value_label}
 
+    def _make_status_row(self, label_text: str, value_text: str) -> dict:
+        row_layout = QHBoxLayout()
+        row_layout.setContentsMargins(4, 0, 4, 0)
+
+        label = QLabel(label_text)
+        label.setObjectName("statusLabel")
+
+        value = QLabel(value_text)
+        value.setObjectName("statusValue")
+        value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        row_layout.addWidget(label)
+        row_layout.addStretch()
+        row_layout.addWidget(value)
+
+        return {"layout": row_layout, "value": value}
+
     def _connect_signals(self) -> None:
         self.steer_dial.valueChanged.connect(self._on_controls_changed)
         self.accel_slider.valueChanged.connect(self._on_controls_changed)
         self.brake_slider.valueChanged.connect(self._on_controls_changed)
+        self.emergency_btn.toggled.connect(self._on_emergency_toggled)
+        self.reset_btn.clicked.connect(self._on_reset_clicked)
+
+    def _mode_id_to_text(self, mode_id: int) -> str:
+        mode_map = {
+            1: "NORMAL",
+            2: "SAFE_MODE",
+            3: "COMM_LOSS",
+            4: "FAULT",
+            5: "EMERGENCY",
+        }
+        return mode_map.get(mode_id, "UNKNOWN")
+
+    def _set_mode_display(self, mode_id: int) -> None:
+        mode_text = self._mode_id_to_text(mode_id)
+        self.mode_value.setText(mode_text)
+
+        if mode_id == 1:
+            color = "#22c55e"
+        elif mode_id == 2:
+            color = "#f59e0b"
+        elif mode_id == 3:
+            color = "#fb923c"
+        elif mode_id in (4, 5):
+            color = "#ef4444"
+        else:
+            color = "#ffffff"
+
+        self.mode_value.setStyleSheet(
+            f"color: {color}; font-size: 16px; font-weight: 800;"
+        )
+
+    def _set_fault_display(self, fault_flag: bool) -> None:
+        if fault_flag:
+            self.fault_value.setText("YES")
+            color = "#ef4444"
+        else:
+            self.fault_value.setText("NO")
+            color = "#22c55e"
+
+        self.fault_value.setStyleSheet(
+            f"color: {color}; font-size: 16px; font-weight: 800;"
+        )
+
+    def _set_viewer_display(self, text: str, color: str = "#ffffff") -> None:
+        self.viewer_state_value.setText(text)
+        self.viewer_state_value.setStyleSheet(
+            f"color: {color}; font-size: 16px; font-weight: 800;"
+        )
 
     def _on_controls_changed(self) -> None:
         self.steer_cmd_deg = self.steer_dial.value()
@@ -434,22 +575,49 @@ class MainWindow(QMainWindow):
         self.brake_value_label.setText(f"{self.brake_cmd_percent}%")
 
         self.last_manual_input_time = time.perf_counter()
-
-        # Immediate priority for manual command
         self._send_last_command()
 
+    def _on_emergency_toggled(self, checked: bool) -> None:
+        self.emergency_active = 1.0 if checked else 0.0
+        self.emergency_btn.setText("EMERGENCY ACTIVE" if checked else "EMERGENCY STOP")
+        self._update_safety_status()
+        self.last_manual_input_time = time.perf_counter()
+        self._send_last_command()
+
+    def _on_reset_clicked(self) -> None:
+        self.reset_cmd = 1.0
+        self._update_safety_status()
+        self.last_manual_input_time = time.perf_counter()
+        self._send_last_command()
+        self.reset_pulse_timer.start(120)
+
+    def _clear_reset_cmd(self) -> None:
+        self.reset_cmd = 0.0
+        self._update_safety_status()
+        self._send_last_command()
+
+    def _update_safety_status(self) -> None:
+        emergency_txt = "ON" if self.emergency_active > 0.5 else "OFF"
+        reset_txt = "1" if self.reset_cmd > 0.5 else "0"
+        self.safety_status_label.setText(f"Emergency: {emergency_txt} | Reset: {reset_txt}")
+
     def _send_last_command(self) -> None:
-        # Compatible with your current udp_link.py that still adds tx_time internally
+        last_rtt_s = float(self.udp_link.latest_feedback.get("rtt_s", 0.0))
+        last_jitter_s = float(self.udp_link.latest_feedback.get("jitter_s", 0.0))
+
         self.udp_link.send_commands(
             float(self.steer_cmd_deg),
             self.accel_cmd_percent / 100.0,
             self.brake_cmd_percent / 100.0,
+            last_rtt_s,
+            last_jitter_s,
+            float(self.emergency_active),
+            float(self.reset_cmd),
         )
 
     def _send_heartbeat_command(self) -> None:
         now = time.perf_counter()
 
-        # If a fresh manual action just happened, skip this heartbeat
         if now - self.last_manual_input_time < self.manual_guard_time:
             return
 
@@ -458,15 +626,35 @@ class MainWindow(QMainWindow):
     def _update_feedback_display(self) -> None:
         fb = self.udp_link.latest_feedback
 
-        speed_mps = fb["speed_mps"]
-        yaw_deg = math.degrees(fb["yaw_rad"])
+        speed_mps = fb.get("speed_mps", 0.0)
+        yaw_deg = math.degrees(fb.get("yaw_rad", 0.0))
         yaw_deg = ((yaw_deg + 180) % 360) - 180
-        yaw_rate_deg_s = math.degrees(fb["yaw_rate_rps"])
+        yaw_rate_deg_s = math.degrees(fb.get("yaw_rate_rps", 0.0))
+        rtt_ms = fb.get("rtt_ms", 0.0)
+        jitter_ms = fb.get("jitter_ms", 0.0)
+        connected = fb.get("connected", False)
+
+        mode_id = int(round(fb.get("mode_id", 0.0)))
+        fault_flag = bool(round(fb.get("fault_flag", 0.0)))
 
         self.speedometer.set_speed(speed_mps)
         self.yaw_value.setText(f"{yaw_deg:.1f}°")
         self.yaw_rate_value.setText(f"{yaw_rate_deg_s:.1f}°/s")
-        self.connection_value.setText("ONLINE" if fb["connected"] else "OFFLINE")
+        self.rtt_value.setText(f"{rtt_ms:.1f} ms")
+        self.jitter_value.setText(f"{jitter_ms:.1f} ms")
+        self.connection_value.setText("ONLINE" if connected else "OFFLINE")
+
+        if connected:
+            self.connection_value.setStyleSheet(
+                "color: #22c55e; font-size: 16px; font-weight: 800;"
+            )
+        else:
+            self.connection_value.setStyleSheet(
+                "color: #ef4444; font-size: 16px; font-weight: 800;"
+            )
+
+        self._set_mode_display(mode_id)
+        self._set_fault_display(fault_flag)
 
     def _list_matching_viewers(self):
         matches = []
@@ -520,20 +708,22 @@ class MainWindow(QMainWindow):
             self.viewer_host.set_embedded_hwnd(hwnd)
             self.viewer_hwnd = hwnd
             self.viewer_embedded = True
-            self.viewer_info.setText("Simulation 3D Viewer embedded")
+            self._set_viewer_display("EMBEDDED", "#22c55e")
             return True
-        except Exception as e:
-            self.viewer_info.setText(f"Embed failed: {e}")
+
+        except Exception:
+            self._set_viewer_display("EMBED FAIL", "#ef4444")
             return False
 
     def _ensure_viewer_embedded(self) -> None:
         if self.viewer_embedded and self.viewer_hwnd is not None and win32gui.IsWindow(self.viewer_hwnd):
             self.viewer_host.set_embedded_hwnd(self.viewer_hwnd)
+            self._set_viewer_display("EMBEDDED", "#22c55e")
             return
 
         hwnd = self._pick_best_viewer_hwnd()
         if hwnd is None:
-            self.viewer_info.setText("Simulation 3D Viewer not found yet")
+            self._set_viewer_display("NOT FOUND", "#f59e0b")
             return
 
         self._embed_viewer_native(hwnd)
@@ -566,6 +756,13 @@ class MainWindow(QMainWindow):
                 border: 1px solid #2a3c5d;
                 border-radius: 16px;
                 padding: 8px;
+            }
+
+            QFrame#viewerStatusFrame {
+                background-color: #0d1626;
+                border: 1px solid #2a3c5d;
+                border-radius: 14px;
+                padding: 4px;
             }
 
             QLabel {
@@ -615,16 +812,21 @@ class MainWindow(QMainWindow):
                 font-weight: 800;
             }
 
-            QLabel#hintLabel {
-                color: #7fa3d6;
+            QLabel#statusLabel {
+                color: #8ec5ff;
                 font-size: 13px;
+                font-weight: 700;
             }
 
-            QLabel#bottomInfo {
-                color: #6f8fbe;
+            QLabel#statusValue {
+                color: #ffffff;
+                font-size: 16px;
+                font-weight: 800;
+            }
+
+            QLabel#hintLabel {
+                color: #7fa3d6;
                 font-size: 12px;
-                padding-top: 2px;
-                padding-bottom: 0px;
             }
 
             QFrame#videoFrame {
@@ -674,5 +876,35 @@ class MainWindow(QMainWindow):
                 margin: -3px;
                 border-radius: 7px;
                 border: 1px solid #991b1b;
+            }
+
+            QPushButton#emergencyButton {
+                background-color: #7f1d1d;
+                color: white;
+                font-size: 16px;
+                font-weight: 800;
+                border: 1px solid #ef4444;
+                border-radius: 12px;
+                padding: 10px;
+            }
+
+            QPushButton#emergencyButton:checked {
+                background-color: #dc2626;
+                color: white;
+                border: 2px solid #fecaca;
+            }
+
+            QPushButton#resetButton {
+                background-color: #a16207;
+                color: white;
+                font-size: 15px;
+                font-weight: 800;
+                border: 1px solid #facc15;
+                border-radius: 12px;
+                padding: 10px;
+            }
+
+            QPushButton#resetButton:pressed {
+                background-color: #ca8a04;
             }
         """)
