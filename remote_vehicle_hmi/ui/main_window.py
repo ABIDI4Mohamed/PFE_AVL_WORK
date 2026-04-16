@@ -14,10 +14,13 @@ Fixes vs previous version
 • Full cinematic dark-automotive aesthetic
 """
 
+import csv
 import math
 import time
 import win32gui
 import win32con
+from pathlib import Path
+from typing import Optional, Dict, Any
 
 from PySide6.QtCore import Qt, QTimer, QRectF, QPointF, QSize, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import (
@@ -31,6 +34,7 @@ from PySide6.QtWidgets import (
 )
 
 from comm.udp_link import UDPLink
+from scenarios.scenario_reference import ScenarioReference
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -632,6 +636,68 @@ def _vsep() -> QFrame:
     return f
 
 
+
+# ═══════════════════════════════════════════════════════════════
+#  SESSION LOGGER
+# ═══════════════════════════════════════════════════════════════
+class SessionLogger:
+    """
+    CSV logger for manual driving sessions.
+    Writes one row per HMI feedback cycle.
+    """
+
+    HEADER = [
+        "timestamp_s",
+        "session_id",
+        "scenario_id",
+        "phase",
+        "steer_in_deg",
+        "throttle_in",
+        "brake_in",
+        "speed_mps",
+        "yaw_rad",
+        "yaw_rate_rps",
+        "mode_id",
+        "fault_flag",
+        "rtt_s",
+        "jitter_s",
+        "steer_ref_deg",
+        "throttle_ref",
+        "brake_ref",
+        "speed_ref_mps",
+        "tol_steer_deg",
+        "tol_throttle",
+        "tol_brake",
+        "tol_speed_mps",
+        "e_steer_deg",
+        "e_throttle",
+        "e_brake",
+        "e_speed_mps",
+    ]
+
+    def __init__(self, csv_path: Path, session_id: str, scenario_id: str) -> None:
+        self.csv_path = Path(csv_path)
+        self.session_id = session_id
+        self.scenario_id = scenario_id
+        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = self.csv_path.open("w", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(self._fh, fieldnames=self.HEADER)
+        self._writer.writeheader()
+        self._fh.flush()
+
+    def write_row(self, row: dict) -> None:
+        safe_row = {k: row.get(k, "") for k in self.HEADER}
+        self._writer.writerow(safe_row)
+        self._fh.flush()
+
+    def close(self) -> None:
+        try:
+            self._fh.flush()
+            self._fh.close()
+        except Exception:
+            pass
+
+
 # ═══════════════════════════════════════════════════════════════
 #  MAIN WINDOW
 # ═══════════════════════════════════════════════════════════════
@@ -655,6 +721,27 @@ class MainWindow(QMainWindow):
         # ── UDP ────────────────────────────────────────────────
         self.udp_link = UDPLink(send_port=25000, recv_port=25001)
         self.udp_link.start_receiver()
+
+        # ── Scenario reference integration ─────────────────────
+        self.scenario_ref: Optional[ScenarioReference] = None
+        self.active_scenario_id: str = "SC01"
+        self.session_t0: float = time.perf_counter()
+        self.current_reference: Optional[Dict[str, Any]] = None
+        self.current_phase: str = "N/A"
+        self.scenario_loaded: bool = False
+
+        self._init_scenario_reference()
+
+        # ── Session logging ────────────────────────────────────
+        self.session_id: str = time.strftime("S%Y%m%d_%H%M%S")
+        self.logs_dir: Path = Path("logs")
+        self.session_logger: Optional[SessionLogger] = None
+        self.logging_enabled: bool = True
+
+        # ── Command mode ───────────────────────────────────────
+        self.use_auto_scenario: bool = True
+
+        self._init_session_logger()
 
         # ── viewer embedding ───────────────────────────────────
         self.viewer_hwnd     = None
@@ -680,6 +767,163 @@ class MainWindow(QMainWindow):
         self.viewer_timer = QTimer(self)
         self.viewer_timer.timeout.connect(self._ensure_viewer_embedded)
         self.viewer_timer.start(1000)
+
+    # ══════════════════════════════════════════════════════════
+    #  SCENARIO REFERENCE
+    # ══════════════════════════════════════════════════════════
+    def _init_scenario_reference(self) -> None:
+        try:
+            scenario_csv = Path("scenarios/scenario_reference_SC01_slow_manual_friendly.csv")
+            if scenario_csv.exists():
+                self.scenario_ref = ScenarioReference(scenario_csv)
+                self.scenario_loaded = True
+                print(f"[SCENARIO] Loaded: {scenario_csv}")
+                print(f"[SCENARIO] Available scenarios: {self.scenario_ref.list_scenarios()}")
+            else:
+                print(f"[SCENARIO] CSV not found: {scenario_csv}")
+        except Exception as exc:
+            self.scenario_ref = None
+            self.scenario_loaded = False
+            print(f"[SCENARIO] Load failed: {exc}")
+
+    def _get_current_reference(self) -> Optional[Dict[str, Any]]:
+        if not self.scenario_loaded or self.scenario_ref is None:
+            self.current_reference = None
+            self.current_phase = "N/A"
+            return None
+
+        t_s = time.perf_counter() - self.session_t0
+        try:
+            ref = self.scenario_ref.get_reference_at_time(self.active_scenario_id, t_s)
+            self.current_reference = ref
+            if ref is not None:
+                self.current_phase = str(ref.get("phase", "N/A"))
+            else:
+                self.current_phase = "N/A"
+            return ref
+        except Exception as exc:
+            print(f"[SCENARIO] Reference retrieval failed: {exc}")
+            self.current_reference = None
+            self.current_phase = "N/A"
+            return None
+
+    def get_tracking_errors(self) -> Optional[Dict[str, float]]:
+        ref = self._get_current_reference()
+        if ref is None:
+            return None
+
+        fb = self.udp_link.latest_feedback
+        speed_mps = float(fb.get("speed_mps", 0.0))
+        cmd = self._get_active_command_values()
+
+        return {
+            "e_steer_deg": float(cmd["steer_deg"]) - float(ref["steer_ref_deg"]),
+            "e_throttle": float(cmd["throttle"]) - float(ref["throttle_ref"]),
+            "e_brake": float(cmd["brake"]) - float(ref["brake_ref"]),
+            "e_speed_mps": speed_mps - float(ref["speed_ref_mps"]),
+        }
+
+    def _get_active_command_values(self) -> Dict[str, float]:
+        if self.use_auto_scenario and self.scenario_loaded:
+            ref = self.current_reference or self._get_current_reference()
+            if ref is not None:
+                return {
+                    "steer_deg": float(ref["steer_ref_deg"]),
+                    "throttle": float(ref["throttle_ref"]),
+                    "brake": float(ref["brake_ref"]),
+                }
+
+        return {
+            "steer_deg": float(self.steer_cmd_deg),
+            "throttle": self.accel_cmd_percent / 100.0,
+            "brake": self.brake_cmd_percent / 100.0,
+        }
+
+    def _update_auto_command_display(self) -> None:
+        if not self.use_auto_scenario or not self.scenario_loaded:
+            return
+
+        ref = self.current_reference or self._get_current_reference()
+        if ref is None:
+            return
+
+        steer_deg = float(ref["steer_ref_deg"])
+        throttle = float(ref["throttle_ref"])
+        brake = float(ref["brake_ref"])
+
+        sign = "+" if steer_deg > 0 else ""
+        self.steer_value_label.setText(f"{sign}{steer_deg:.0f}°")
+        self.accel_value_label.setText(f"{throttle * 100:.0f}%")
+        self.brake_value_label.setText(f"{brake * 100:.0f}%")
+
+        try:
+            self.steer_dial.setValue(int(round(steer_deg)))
+            self.accel_slider.setValue(int(round(throttle * 100)))
+            self.brake_slider.setValue(int(round(brake * 100)))
+        except Exception:
+            pass
+
+    def _init_session_logger(self) -> None:
+        if not self.logging_enabled:
+            return
+
+        try:
+            scenario_name = self.active_scenario_id if self.scenario_loaded else "NO_SCENARIO"
+            log_filename = f"{self.session_id}_{scenario_name}.csv"
+            log_path = self.logs_dir / log_filename
+            self.session_logger = SessionLogger(
+                csv_path=log_path,
+                session_id=self.session_id,
+                scenario_id=scenario_name,
+            )
+            print(f"[LOGGER] Logging session to: {log_path}")
+        except Exception as exc:
+            self.session_logger = None
+            print(f"[LOGGER] Failed to initialize logger: {exc}")
+
+    def _log_current_sample(self) -> None:
+        if not self.logging_enabled or self.session_logger is None:
+            return
+
+        try:
+            fb = self.udp_link.latest_feedback or {}
+            ref = self.current_reference or self._get_current_reference()
+            errs = self.get_tracking_errors()
+
+            cmd = self._get_active_command_values()
+
+            row = {
+                "timestamp_s": round(time.perf_counter() - self.session_t0, 3),
+                "session_id": self.session_id,
+                "scenario_id": self.active_scenario_id if self.scenario_loaded else "N/A",
+                "phase": self.current_phase,
+                "steer_in_deg": float(cmd["steer_deg"]),
+                "throttle_in": float(cmd["throttle"]),
+                "brake_in": float(cmd["brake"]),
+                "speed_mps": float(fb.get("speed_mps", 0.0)),
+                "yaw_rad": float(fb.get("yaw_rad", 0.0)),
+                "yaw_rate_rps": float(fb.get("yaw_rate_rps", 0.0)),
+                "mode_id": int(round(float(fb.get("mode_id", 0.0)))),
+                "fault_flag": int(round(float(fb.get("fault_flag", 0.0)))),
+                "rtt_s": float(fb.get("rtt_s", 0.0)),
+                "jitter_s": float(fb.get("jitter_s", 0.0)),
+                "steer_ref_deg": float(ref["steer_ref_deg"]) if ref else "",
+                "throttle_ref": float(ref["throttle_ref"]) if ref else "",
+                "brake_ref": float(ref["brake_ref"]) if ref else "",
+                "speed_ref_mps": float(ref["speed_ref_mps"]) if ref else "",
+                "tol_steer_deg": float(ref["tol_steer_deg"]) if ref else "",
+                "tol_throttle": float(ref["tol_throttle"]) if ref else "",
+                "tol_brake": float(ref["tol_brake"]) if ref else "",
+                "tol_speed_mps": float(ref["tol_speed_mps"]) if ref else "",
+                "e_steer_deg": float(errs["e_steer_deg"]) if errs else "",
+                "e_throttle": float(errs["e_throttle"]) if errs else "",
+                "e_brake": float(errs["e_brake"]) if errs else "",
+                "e_speed_mps": float(errs["e_speed_mps"]) if errs else "",
+            }
+
+            self.session_logger.write_row(row)
+        except Exception as exc:
+            print(f"[LOGGER] Failed to write sample: {exc}")
 
     # ══════════════════════════════════════════════════════════
     #  UI CONSTRUCTION
@@ -800,6 +1044,21 @@ class MainWindow(QMainWindow):
         hint.setAlignment(Qt.AlignCenter)
         hint.setWordWrap(True)
         lv.addWidget(hint)
+
+        self.scenario_info_label = QLabel(
+            f"Scenario: {self.active_scenario_id if self.scenario_loaded else 'N/A'}  ·  Phase: {self.current_phase}  ·  Mode: {'AUTO' if self.use_auto_scenario else 'MANUAL'}"
+        )
+        self.scenario_info_label.setObjectName("hintLabel")
+        self.scenario_info_label.setAlignment(Qt.AlignCenter)
+        self.scenario_info_label.setWordWrap(True)
+        lv.addWidget(self.scenario_info_label)
+
+        log_text = f"Logging: ON  ·  Session: {self.session_id}  ·  Cmd Mode: {'AUTO' if self.use_auto_scenario else 'MANUAL'}"
+        self.logger_info_label = QLabel(log_text)
+        self.logger_info_label.setObjectName("hintLabel")
+        self.logger_info_label.setAlignment(Qt.AlignCenter)
+        self.logger_info_label.setWordWrap(True)
+        lv.addWidget(self.logger_info_label)
 
         return panel
 
@@ -1105,6 +1364,16 @@ class MainWindow(QMainWindow):
     def _update_feedback_display(self) -> None:
         fb = self.udp_link.latest_feedback
 
+        # Update current scenario reference
+        self._get_current_reference()
+        self._update_auto_command_display()
+        if hasattr(self, "scenario_info_label"):
+            scenario_txt = self.active_scenario_id if self.scenario_loaded else "N/A"
+            mode_txt = "AUTO" if self.use_auto_scenario else "MANUAL"
+            self.scenario_info_label.setText(
+                f"Scenario: {scenario_txt}  ·  Phase: {self.current_phase}  ·  Mode: {mode_txt}"
+            )
+
         speed_mps      = fb.get("speed_mps",     0.0)
         yaw_deg        = math.degrees(fb.get("yaw_rad",      0.0))
         yaw_deg        = ((yaw_deg + 180) % 360) - 180
@@ -1133,6 +1402,8 @@ class MainWindow(QMainWindow):
         self._set_mode_display(mode_id)
         self._set_fault_display(fault_flag)
         self._refresh_alert(fault_flag)
+
+        self._log_current_sample()
 
     # ══════════════════════════════════════════════════════════
     #  VIEWER EMBEDDING  (unchanged logic; resize now fills frame)
@@ -1220,6 +1491,11 @@ class MainWindow(QMainWindow):
         self._embed_viewer_native(hwnd)
 
     def closeEvent(self, event) -> None:
+        try:
+            if self.session_logger is not None:
+                self.session_logger.close()
+        except Exception:
+            pass
         self.udp_link.stop()
         super().closeEvent(event)
 
