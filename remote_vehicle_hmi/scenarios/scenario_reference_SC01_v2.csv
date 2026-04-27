@@ -1,0 +1,7 @@
+scenario_id,step_id,time_s,phase,steer_ref_deg,throttle_ref,brake_ref,speed_min_mps,speed_max_mps,tol_steer_deg,tol_throttle,tol_brake,eval_method
+SC01,STEP01,0,start,0,0,0,0,0.1,2,1,0.05,interval
+SC01,STEP02,5,accel_1,0,0.12,0,0.1,1.3,2,1,0.05,interval
+SC01,STEP03,10,accel_2,0,0.2,0,1.1,3.3,2,1,0.05,interval
+SC01,STEP04,14,stabilize,0,0.09,0,3.5,5.1,2,0.5,0.05,interval
+SC01,STEP05,22,hold,0,0.03,0,4.2,5.1,2,0.5,0.05,interval
+SC01,STEP06,36,end,0,0,0.8,0,5,2,1,0.05,interval
